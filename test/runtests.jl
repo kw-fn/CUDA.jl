@@ -76,7 +76,12 @@ for (rootpath, dirs, files) in walkdir(@__DIR__)
 
   append!(tests, files)
   for file in files
-    test_runners[file] = ()->include("$(@__DIR__)/$file.jl")
+    #if !occursin(file, "blasmg")
+        test_runners[file] = ()->include("$(@__DIR__)/$file.jl")
+    #else
+    #    str = "$(@__DIR__)/$file.jl"
+    #    test_runners[file] = run(pipeline(`$(Base.julia_cmd()) --project $str`; stdout = stdout, stderr = stderr), wait = false)
+    #end
   end
 end
 ## GPUArrays testsuite
@@ -158,6 +163,7 @@ ENV["CUDA_VISIBLE_DEVICES"] = join(map(pick->"GPU-$(pick.uuid)", picks), ",")
 # determine tests to skip
 skip_tests = []
 has_cudnn() || push!(skip_tests, "cudnn")
+has_cusolvermg() || push!(skip_tests, "cusolvermg")
 has_nvml() || push!(skip_tests, "nvml")
 if !has_cutensor() || CUDA.version() < v"10.1" || first(picks).cap < v"7.0"
     push!(skip_tests, "cutensor")
