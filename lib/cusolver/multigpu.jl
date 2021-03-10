@@ -7,40 +7,35 @@
 # NOTE: in the cublasMg preview, which also relies on this functionality, a separate library
 #       called 'cudalibmg' is introduced. factor this out when we actually ship that.
 
-mutable struct CudaLibMGDescriptor
+mutable struct MatrixDescriptor
     desc::cudaLibMgMatrixDesc_t
 
-    function CudaLibMGDescriptor(a, grid; rowblocks = size(a, 1), colblocks = size(a, 2), elta = eltype(a) )
+    function MatrixDescriptor(a, grid; rowblocks = size(a, 1), colblocks = size(a, 2), elta=eltype(a) )
         desc = Ref{cudaLibMgMatrixDesc_t}()
-        try
-            cudaLibMgCreateMatrixDesc(desc, size(a, 1), size(a, 2), rowblocks, colblocks, elta, grid)
-        catch e
-            println("size(A) = $(size(a)), rowblocks = $rowblocks, colblocks = $colblocks")
-            flush(stdout)
-            throw(e)
-        end
+        cusolverMgCreateMatrixDesc(desc, size(a, 1), size(a, 2), rowblocks, colblocks, elta, grid)
         return new(desc[])
     end
 end
 
-Base.cconvert(::Type{cudaLibMgMatrixDesc_t}, obj::CudaLibMGDescriptor) = obj.desc
+Base.unsafe_convert(::Type{cudaLibMgMatrixDesc_t}, obj::MatrixDescriptor) = obj.desc
 
-mutable struct CudaLibMGGrid
-    desc::Ref{cudaLibMgGrid_t}
+mutable struct DeviceGrid
+    desc::cudaLibMgGrid_t
 
-    function CudaLibMGGrid(num_row_devs, num_col_devs, deviceIds, mapping)
+    function DeviceGrid(num_row_devs, num_col_devs, deviceIds, mapping)
+        @assert num_row_devs == 1 "Only 1-D column block cyclic is supported, so numRowDevices must be equal to 1."
         desc = Ref{cudaLibMgGrid_t}()
-        cudaLibMgCreateDeviceGrid(desc, num_row_devs, num_col_devs, deviceIds, mapping)
-        return new(desc)
+        cusolverMgCreateDeviceGrid(desc, num_row_devs, num_col_devs, deviceIds, mapping)
+        return new(desc[])
     end
 end
 
-Base.cconvert(::Type{cudaLibMgGrid_t}, obj::CudaLibMGGrid) = obj.desc[]
+Base.unsafe_convert(::Type{cudaLibMgGrid_t}, obj::DeviceGrid) = obj.desc
 
-function allocateBuffers(n_row_devs, n_col_devs, descr, mat::Matrix)
+function allocateBuffers(n_row_devs, n_col_devs, mat::Matrix)
     mat_row_block_size = div(size(mat, 1), n_row_devs)
     mat_col_block_size = div(size(mat, 2), n_col_devs)
-    mat_buffers  = Vector{CuMatrix}(undef, ndevices())
+    mat_buffers  = Vector{CuMatrix{eltype(mat)}}(undef, ndevices())
     mat_numRows  = Vector{Int64}(undef, ndevices())
     mat_numCols  = Vector{Int64}(undef, ndevices())
     typesize = sizeof(eltype(mat))
@@ -70,7 +65,7 @@ function allocateBuffers(n_row_devs, n_col_devs, descr, mat::Matrix)
     return mat_buffers
 end
 
-function returnBuffers(n_row_devs, n_col_devs, row_block_size, col_block_size, desc, dDs, D)
+function returnBuffers(n_row_devs, n_col_devs, row_block_size, col_block_size, dDs, D)
     row_block_size = div(size(D, 1), n_row_devs)
     col_block_size = div(size(D, 2), n_col_devs)
     numRows  = [row_block_size for dev in 1:ndevices()]
@@ -106,23 +101,21 @@ end
 
 function mg_syevd!(jobz::Char, uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     if uplo != 'L'
         throw(ArgumentError("only lower fill mode (uplo='L') supported"))
     end
     m, n    = size(A)
     N       = div(size(A, 2), ndevices()) # dimension of the sub-matrix
-    descRef = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     workspace     = Vector{CuArray}(undef, ndevices())
     W             = Vector{real(eltype(A))}(undef, n)
-    cusolverMgCreateMatrixDesc(descRef, m, n, m, N, eltype(A), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
+    desc = MatrixDescriptor(A, grid; colblocks=N)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
     IA            = 1 # for now
     JA            = 1
     GC.@preserve A_arr begin
-        cusolverMgSyevd_bufferSize(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, descRef[], W, real(eltype(A)), eltype(A), lwork)
+        cusolverMgSyevd_bufferSize(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, desc, W, real(eltype(A)), eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -132,12 +125,12 @@ function mg_syevd!(jobz::Char, uplo::Char, A; dev_rows=1, dev_cols=ndevices()) #
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr workspace begin
-        cusolverMgSyevd(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, descRef[], W, real(eltype(A)), eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgSyevd(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, desc, W, real(eltype(A)), eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), descRef[], A_arr, A)
+    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), A_arr, A)
     if jobz == 'N'
         return W
     elseif jobz == 'V'
@@ -147,22 +140,20 @@ end
 
 function mg_potrf!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     if uplo != 'L'
         throw(ArgumentError("only lower fill mode (uplo='L') supported"))
     end
     m, n    = size(A)
     N       = div(size(A, 2), ndevices()) # dimension of the sub-matrix
-    descRef = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     workspace     = Vector{CuArray}(undef, ndevices())
-    cusolverMgCreateMatrixDesc(descRef, m, n, m, N, eltype(A), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
+    desc = MatrixDescriptor(A, grid; colblocks=N)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
     IA      = 1 # for now
     JA      = 1
     GC.@preserve A_arr begin
-        cusolverMgPotrf_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), lwork)
+        cusolverMgPotrf_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, desc, eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -172,33 +163,31 @@ function mg_potrf!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr workspace begin
-        cusolverMgPotrf(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgPotrf(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, desc, eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), descRef[], A_arr, A)
+    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), A_arr, A)
     return A
 end
 
 function mg_potri!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     if uplo != 'L'
         throw(ArgumentError("only lower fill mode (uplo='L') supported"))
     end
     m, n    = size(A)
     N       = div(size(A, 2), ndevices()) # dimension of the sub-matrix
-    descRef = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     workspace     = Vector{CuArray}(undef, ndevices())
-    cusolverMgCreateMatrixDesc(descRef, m, n, m, N, eltype(A), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
+    desc = MatrixDescriptor(A, grid; colblocks=N)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
     IA      = 1 # for now
     JA      = 1
     GC.@preserve A_arr begin
-        cusolverMgPotri_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), lwork)
+        cusolverMgPotri_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, desc, eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -208,40 +197,37 @@ function mg_potri!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr workspace begin
-        cusolverMgPotri(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgPotri(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, desc, eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), descRef[], A_arr, A)
+    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), A_arr, A)
     return A
 end
 
 function mg_potrs!(uplo::Char, A, B; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     if uplo != 'L'
         throw(ArgumentError("only lower fill mode (uplo='L') supported"))
     end
     ma, na   = size(A)
-    mb, nb   = size(A)
+    mb, nb   = size(B)
     NA       = div(size(A, 2), ndevices()) # dimension of the sub-matrix
     NB       = div(size(B, 2), ndevices()) # dimension of the sub-matrix
-    descRefA = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
-    descRefB = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     workspace     = Vector{CuArray}(undef, ndevices())
-    cusolverMgCreateMatrixDesc(descRefA, ma, na, ma, NA, eltype(A), gridRef[]) # only 1-D column is supported for now
-    cusolverMgCreateMatrixDesc(descRefB, mb, nb, mb, NB, eltype(B), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRefA[], A)
-    B_arr     = allocateBuffers(dev_rows, dev_cols, descRefB[], B)
+    descA = MatrixDescriptor(A, grid; colblocks=NA)
+    descB = MatrixDescriptor(A, grid; colblocks=NB)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
+    B_arr     = allocateBuffers(dev_rows, dev_cols, B)
     IA      = 1 # for now
     JA      = 1
     IB      = 1 # for now
     JB      = 1
     GC.@preserve A_arr B_arr begin
-        cusolverMgPotrs_bufferSize(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(B_arr), IB, JB, descRefB[], eltype(A), lwork)
+        cusolverMgPotrs_bufferSize(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descA, pointer.(B_arr), IB, JB, descB, eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -251,27 +237,25 @@ function mg_potrs!(uplo::Char, A, B; dev_rows=1, dev_cols=ndevices()) # one host
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr B_arr workspace begin
-        cusolverMgPotrs(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(B_arr), IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgPotrs(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descA, pointer.(B_arr), IB, JB, descB, eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    B = returnBuffers(dev_rows, dev_cols, div(size(B, 1), dev_rows), div(size(B, 2), dev_cols), descRefB[], B_arr, B)
+    B = returnBuffers(dev_rows, dev_cols, div(size(B, 1), dev_rows), div(size(B, 2), dev_cols), B_arr, B)
     return B
 end
 
 function mg_getrf!(A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     m, n    = size(A)
     N       = div(size(A, 2), ndevices()) # dimension of the sub-matrix
-    descRef = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     ipivs         = Vector{CuVector{Cint}}(undef, ndevices())
     workspace     = Vector{CuArray}(undef, ndevices())
-    cusolverMgCreateMatrixDesc(descRef, m, n, m, N, eltype(A), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
+    desc = MatrixDescriptor(A, grid; colblocks=N)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
     IA      = 1 # for now
     JA      = 1
     for (di, dev) in enumerate(devices())
@@ -281,7 +265,7 @@ function mg_getrf!(A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     end
     device!(dev)
     GC.@preserve A_arr ipivs begin
-        cusolverMgGetrf_bufferSize(mg_handle(), m, n, pointer.(A_arr), IA, JA, descRef[], pointer.(ipivs), eltype(A), lwork)
+        cusolverMgGetrf_bufferSize(mg_handle(), m, n, pointer.(A_arr), IA, JA, desc, pointer.(ipivs), eltype(A), lwork)
     end
     synchronize_all()
     for (di, dev) in enumerate(devices())
@@ -292,13 +276,13 @@ function mg_getrf!(A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr ipivs workspace begin
-        cusolverMgGetrf(mg_handle(), m, n, pointer.(A_arr), IA, JA, descRef[], pointer.(ipivs), eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgGetrf(mg_handle(), m, n, pointer.(A_arr), IA, JA, desc, pointer.(ipivs), eltype(A), pointer.(workspace), lwork[], info)
     end
     synchronize_all()
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), descRef[], A_arr, A)
+    A = returnBuffers(dev_rows, dev_cols, div(size(A, 1), dev_rows), div(size(A, 2), dev_cols), A_arr, A)
     ipiv = Vector{Int}(undef, n)
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -310,21 +294,18 @@ end
 
 function mg_getrs!(trans, A, ipiv, B; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     dev = device()
-    gridRef = Ref{cudaLibMgGrid_t}(C_NULL)
-    cusolverMgCreateDeviceGrid(gridRef, 1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
+    grid = DeviceGrid(1, ndevices(), devices(), CUDALIBMG_GRID_MAPPING_COL_MAJOR)
     ma, na  = size(A)
     mb, nb  = size(B)
     NA      = div(size(A, 2), ndevices()) # dimension of the sub-matrix
     NB      = div(size(B, 2), ndevices()) # dimension of the sub-matrix
-    descRefA      = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
-    descRefB      = Ref{cudaLibMgMatrixDesc_t}(C_NULL)
     lwork         = Ref{Int64}(0)
     ipivs         = Vector{CuVector{Cint}}(undef, ndevices())
     workspace     = Vector{CuArray}(undef, ndevices())
-    cusolverMgCreateMatrixDesc(descRefA, ma, na, ma, NA, eltype(A), gridRef[]) # only 1-D column is supported for now
-    cusolverMgCreateMatrixDesc(descRefB, mb, nb, mb, NB, eltype(B), gridRef[]) # only 1-D column is supported for now
-    A_arr     = allocateBuffers(dev_rows, dev_cols, descRefA[], A)
-    B_arr     = allocateBuffers(dev_rows, dev_cols, descRefB[], B)
+    descA = MatrixDescriptor(A, grid; colblocks=NA)
+    descB = MatrixDescriptor(A, grid; colblocks=NB)
+    A_arr     = allocateBuffers(dev_rows, dev_cols, A)
+    B_arr     = allocateBuffers(dev_rows, dev_cols, B)
     IA      = 1 # for now
     JA      = 1
     IB      = 1 # for now
@@ -337,7 +318,7 @@ function mg_getrs!(trans, A, ipiv, B; dev_rows=1, dev_cols=ndevices()) # one hos
     end
     device!(dev)
     GC.@preserve A_arr B_arr ipivs begin
-        cusolverMgGetrs_bufferSize(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(ipivs), pointer.(B_arr), IB, JB, descRefB[], eltype(A), lwork)
+        cusolverMgGetrs_bufferSize(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descA, pointer.(ipivs), pointer.(B_arr), IB, JB, descB, eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -347,11 +328,11 @@ function mg_getrs!(trans, A, ipiv, B; dev_rows=1, dev_cols=ndevices()) # one hos
     device!(dev)
     info = Ref{Cint}(C_NULL)
     GC.@preserve A_arr B_arr ipivs workspace begin
-        cusolverMgGetrs(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(ipivs), pointer.(B_arr), IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
+        cusolverMgGetrs(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descA, pointer.(ipivs), pointer.(B_arr), IB, JB, descB, eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
     end
-    B = returnBuffers(dev_rows, dev_cols, div(size(B, 1), dev_rows), div(size(B, 2), dev_cols), descRefB[], B_arr, B)
+    B = returnBuffers(dev_rows, dev_cols, div(size(B, 1), dev_rows), div(size(B, 2), dev_cols), B_arr, B)
     return B
 end
