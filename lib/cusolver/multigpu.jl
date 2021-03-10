@@ -59,7 +59,7 @@ function allocateBuffers(n_row_devs, n_col_devs, descr, mat::Matrix)
     for (di, dev) in enumerate(devices())
         device!(dev)
         mat_gpu_buf = CuMatrix{eltype(mat)}(undef, size(mat))
-        @inbounds copyto!(mat_gpu_buf, mat_cpu_bufs[di])
+        unsafe_copyto!(mat_gpu_buf, 1, mat_cpu_bufs[di], 1, length(mat_cpu_bufs[di]))
         mat_buffers[di] = mat_gpu_buf
     end
     for (di, dev) in enumerate(devices())
@@ -85,7 +85,7 @@ function returnBuffers(n_row_devs, n_col_devs, row_block_size, col_block_size, d
         row_inds = ((dev_row-1)*row_block_size+1):min(dev_row*row_block_size, size(D, 1))
         col_inds = ((dev_col-1)*col_block_size+1):min(dev_col*col_block_size, size(D, 2))
         cpu_bufs[di] = Matrix{eltype(D)}(undef, length(row_inds), length(col_inds))
-        @inbounds copyto!(cpu_bufs[di], dDs[di])
+        unsafe_copyto!(cpu_bufs[di], 1, dDs[di], 1, length(cpu_bufs[di]))
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
