@@ -121,7 +121,9 @@ function mg_syevd!(jobz::Char, uplo::Char, A; dev_rows=1, dev_cols=ndevices()) #
     A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
     IA            = 1 # for now
     JA            = 1
-    cusolverMgSyevd_bufferSize(mg_handle(), jobz, uplo, n, A_arr, IA, JA, descRef[], W, real(eltype(A)), eltype(A), lwork)
+    GC.@preserve A_arr begin
+        cusolverMgSyevd_bufferSize(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, descRef[], W, real(eltype(A)), eltype(A), lwork)
+    end
     for (di, dev) in enumerate(devices())
         device!(dev)
         workspace[di] = CUDA.zeros(eltype(A), lwork[])
@@ -129,8 +131,8 @@ function mg_syevd!(jobz::Char, uplo::Char, A; dev_rows=1, dev_cols=ndevices()) #
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve workspace begin
-        cusolverMgSyevd(mg_handle(), jobz, uplo, n, A_arr, IA, JA, descRef[], W, real(eltype(A)), eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr workspace begin
+        cusolverMgSyevd(mg_handle(), jobz, uplo, n, pointer.(A_arr), IA, JA, descRef[], W, real(eltype(A)), eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
@@ -159,7 +161,9 @@ function mg_potrf!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
     IA      = 1 # for now
     JA      = 1
-    cusolverMgPotrf_bufferSize(mg_handle(), uplo, n, A_arr, IA, JA, descRef[], eltype(A), lwork)
+    GC.@preserve A_arr begin
+        cusolverMgPotrf_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), lwork)
+    end
     for (di, dev) in enumerate(devices())
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -167,8 +171,8 @@ function mg_potrf!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve workspace begin
-        cusolverMgPotrf(mg_handle(), uplo, n, A_arr, IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr workspace begin
+        cusolverMgPotrf(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
@@ -193,7 +197,9 @@ function mg_potri!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     A_arr     = allocateBuffers(dev_rows, dev_cols, descRef[], A)
     IA      = 1 # for now
     JA      = 1
-    cusolverMgPotri_bufferSize(mg_handle(), uplo, n, A_arr, IA, JA, descRef[], eltype(A), lwork)
+    GC.@preserve A_arr begin
+        cusolverMgPotri_bufferSize(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), lwork)
+    end
     for (di, dev) in enumerate(devices())
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -201,8 +207,8 @@ function mg_potri!(uplo::Char, A; dev_rows=1, dev_cols=ndevices()) # one host-si
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve workspace begin
-        cusolverMgPotri(mg_handle(), uplo, n, A_arr, IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr workspace begin
+        cusolverMgPotri(mg_handle(), uplo, n, pointer.(A_arr), IA, JA, descRef[], eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
@@ -234,7 +240,9 @@ function mg_potrs!(uplo::Char, A, B; dev_rows=1, dev_cols=ndevices()) # one host
     JA      = 1
     IB      = 1 # for now
     JB      = 1
-    cusolverMgPotrs_bufferSize(mg_handle(), uplo, na, nb, A_arr, IA, JA, descRefA[], B_arr, IB, JB, descRefB[], eltype(A), lwork)
+    GC.@preserve A_arr B_arr begin
+        cusolverMgPotrs_bufferSize(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(B_arr), IB, JB, descRefB[], eltype(A), lwork)
+    end
     for (di, dev) in enumerate(devices())
         device!(dev)
         workspace[di]     = CUDA.zeros(eltype(A), lwork[])
@@ -242,8 +250,8 @@ function mg_potrs!(uplo::Char, A, B; dev_rows=1, dev_cols=ndevices()) # one host
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve workspace begin
-        cusolverMgPotrs(mg_handle(), uplo, na, nb, A_arr, IA, JA, descRefA[], B_arr, IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr B_arr workspace begin
+        cusolverMgPotrs(mg_handle(), uplo, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(B_arr), IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
@@ -272,8 +280,8 @@ function mg_getrf!(A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
         synchronize()
     end
     device!(dev)
-    GC.@preserve ipivs begin
-        cusolverMgGetrf_bufferSize(mg_handle(), m, n, A_arr, IA, JA, descRef[], pointer.(ipivs), eltype(A), lwork)
+    GC.@preserve A_arr ipivs begin
+        cusolverMgGetrf_bufferSize(mg_handle(), m, n, pointer.(A_arr), IA, JA, descRef[], pointer.(ipivs), eltype(A), lwork)
     end
     synchronize_all()
     for (di, dev) in enumerate(devices())
@@ -283,8 +291,8 @@ function mg_getrf!(A; dev_rows=1, dev_cols=ndevices()) # one host-side array A
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve ipivs workspace begin
-        cusolverMgGetrf(mg_handle(), m, n, A_arr, IA, JA, descRef[], pointer.(ipivs), eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr ipivs workspace begin
+        cusolverMgGetrf(mg_handle(), m, n, pointer.(A_arr), IA, JA, descRef[], pointer.(ipivs), eltype(A), pointer.(workspace), lwork[], info)
     end
     synchronize_all()
     if info[] < 0
@@ -328,8 +336,8 @@ function mg_getrs!(trans, A, ipiv, B; dev_rows=1, dev_cols=ndevices()) # one hos
         synchronize()
     end
     device!(dev)
-    GC.@preserve ipivs begin
-        cusolverMgGetrs_bufferSize(mg_handle(), trans, na, nb, A_arr, IA, JA, descRefA[], pointer.(ipivs), B_arr, IB, JB, descRefB[], eltype(A), lwork)
+    GC.@preserve A_arr B_arr ipivs begin
+        cusolverMgGetrs_bufferSize(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(ipivs), pointer.(B_arr), IB, JB, descRefB[], eltype(A), lwork)
     end
     for (di, dev) in enumerate(devices())
         device!(dev)
@@ -338,8 +346,8 @@ function mg_getrs!(trans, A, ipiv, B; dev_rows=1, dev_cols=ndevices()) # one hos
     end
     device!(dev)
     info = Ref{Cint}(C_NULL)
-    GC.@preserve ipivs workspace begin
-        cusolverMgGetrs(mg_handle(), trans, na, nb, A_arr, IA, JA, descRefA[], pointer.(ipivs), B_arr, IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
+    GC.@preserve A_arr B_arr ipivs workspace begin
+        cusolverMgGetrs(mg_handle(), trans, na, nb, pointer.(A_arr), IA, JA, descRefA[], pointer.(ipivs), pointer.(B_arr), IB, JB, descRefB[], eltype(A), pointer.(workspace), lwork[], info)
     end
     if info[] < 0
         throw(ArgumentError("The $(info[])th parameter is wrong"))
